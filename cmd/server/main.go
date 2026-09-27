@@ -5,10 +5,14 @@ import (
 	"log"
 	"net"
 	"os"
+	"strings"
 
 	"github.com/kyndverse/permify-go/internal/authentication"
 	"github.com/kyndverse/permify-go/internal/authorization"
-	pb "github.com/kyndverse/permify-go/proto"
+
+	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
+	authv3 "github.com/envoyproxy/go-control-plane/envoy/service/auth/v3"
+	typev3 "github.com/envoyproxy/go-control-plane/envoy/type/v3"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -16,68 +20,149 @@ import (
 )
 
 type authorizationServer struct {
-	pb.UnimplementedAuthorizationServiceServer
+	authv3.UnimplementedAuthorizationServer
 
 	authService   *authorization.Service
 	tokenVerifier *authentication.JWTVerifier
 }
 
-func (s *authorizationServer) Check(ctx context.Context, req *pb.CheckRequest) (*pb.CheckResponse, error) {
-	if req.GetAccessToken() == "" {
-		return nil, status.Error(
-			codes.Unauthenticated,
-			"access token is required",
-		)
-	}
+func (s *authorizationServer) Check(ctx context.Context, req *authv3.CheckRequest) (*authv3.CheckResponse, error) {
+	httpRequest := req.GetAttributes().
+		GetRequest().
+		GetHttp()
 
-	if req.GetMethod() == "" {
-		return nil, status.Error(
+	if httpRequest == nil {
+		return deny(
 			codes.InvalidArgument,
-			"method is required",
-		)
+			typev3.StatusCode_BadRequest,
+			"missing HTTP request information",
+		), nil
 	}
 
-	if req.GetPath() == "" {
-		return nil, status.Error(
-			codes.InvalidArgument,
-			"path is required",
-		)
-	}
+	method := httpRequest.GetMethod()
+	path := httpRequest.GetPath()
 
-	claims, err := s.tokenVerifier.Verify(
-		req.GetAccessToken(),
-	)
-
-	if err != nil {
-		log.Printf(
-			"token verification failed: %v",
-			err,
-		)
-
-		return nil, status.Error(
-			codes.Unauthenticated,
-			"invalid or expired access token",
-		)
-	}
+	authHeader := httpRequest.
+		GetHeaders()["authorization"]
 
 	log.Printf(
-		"authorization check user=%s role=%s method=%s path=%s",
-		claims.Subject,
-		claims.Role,
-		req.GetMethod(),
-		req.GetPath(),
+		"authorization check method=%s path=%s",
+		method,
+		path,
 	)
+
+	token, ok := extractBearerToken(authHeader)
+	if !ok {
+		return deny(
+			codes.Unauthenticated,
+			typev3.StatusCode_Unauthorized,
+			"missing or invalid Authorization header",
+		), nil
+	}
+
+	claims, err := s.tokenVerifier.Verify(token)
+	if err != nil {
+		log.Printf("JWT verification failed: %v", err)
+
+		return deny(
+			codes.Unauthenticated,
+			typev3.StatusCode_Unauthorized,
+			"invalid or expired access token",
+		), nil
+	}
 
 	allowed, reason := s.authService.Authorize(
 		claims.Role,
-		req.GetMethod(),
-		req.GetPath(),
+		method,
+		path,
 	)
 
-	return &pb.CheckResponse{
-		Allowed: allowed,
-		Reason:  reason,
-	}, nil
+	log.Printf(
+		"user=%s role=%s permission_result=%t reason=%s",
+		claims.Subject,
+		claims.Role,
+		allowed,
+		reason,
+	)
+
+	if !allowed {
+		return deny(
+			codes.PermissionDenied,
+			typev3.StatusCode_Forbidden,
+			reason,
+		), nil
+	}
+
+	return allow(
+		claims.Subject,
+		claims.Role,
+	), nil
+}
+
+func extractBearerToken(header string) (string, bool) {
+	parts := strings.SplitN(header, " ", 2)
+
+	if len(parts) != 2 {
+		return "", false
+	}
+
+	if !strings.EqualFold(parts[0], "Bearer") {
+		return "", false
+	}
+
+	token := strings.TrimSpace(parts[1])
+
+	if token == "" {
+		return "", false
+	}
+
+	return token, true
+}
+
+func allow(userID string, role string) *authv3.CheckResponse {
+	return &authv3.CheckResponse{
+		Status: status.New(
+			codes.OK,
+			"authorized",
+		).Proto(),
+
+		HttpResponse: &authv3.CheckResponse_OkResponse{
+			OkResponse: &authv3.OkHttpResponse{
+				Headers: []*corev3.HeaderValueOption{
+					{
+						Header: &corev3.HeaderValue{
+							Key:   "x-current-user",
+							Value: userID,
+						},
+					},
+					{
+						Header: &corev3.HeaderValue{
+							Key:   "x-current-role",
+							Value: role,
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
+func deny(grpcCode codes.Code, httpCode typev3.StatusCode, message string) *authv3.CheckResponse {
+	return &authv3.CheckResponse{
+		Status: status.New(
+			grpcCode,
+			message,
+		).Proto(),
+
+		HttpResponse: &authv3.CheckResponse_DeniedResponse{
+			DeniedResponse: &authv3.DeniedHttpResponse{
+				Status: &typev3.HttpStatus{
+					Code: httpCode,
+				},
+				Body: message,
+			},
+		},
+	}
 }
 
 func main() {
@@ -91,7 +176,6 @@ func main() {
 		"tcp",
 		":50051",
 	)
-
 	if err != nil {
 		log.Fatalf(
 			"failed to listen: %v",
@@ -99,14 +183,15 @@ func main() {
 		)
 	}
 
-	authService := authorization.NewService()
+	authService :=
+		authorization.NewService()
 
 	tokenVerifier :=
 		authentication.NewJWTVerifier(jwtSecret)
 
 	grpcServer := grpc.NewServer()
 
-	pb.RegisterAuthorizationServiceServer(
+	authv3.RegisterAuthorizationServer(
 		grpcServer,
 		&authorizationServer{
 			authService:   authService,
@@ -115,7 +200,7 @@ func main() {
 	)
 
 	log.Println(
-		"GopherGuard running on :50051",
+		"GopherGuard ext_authz server running on :50051",
 	)
 
 	if err := grpcServer.Serve(listener); err != nil {
