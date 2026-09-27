@@ -1,0 +1,20 @@
+syntax = "proto3";
+
+package auth;
+
+option go_package = "permify-go/proto;proto";
+
+service AuthorizationService {
+  rpc Check(CheckRequest) returns (CheckResponse);
+}
+
+message CheckRequest {
+  string access_token = 1;
+  string method = 2;
+  string path = 3;
+}
+
+message CheckResponse {
+  bool allowed = 1;
+  string reason = 2;
+}
