@@ -9,6 +9,7 @@ import (
 
 	"github.com/kyndverse/permify-go/internal/authentication"
 	"github.com/kyndverse/permify-go/internal/authorization"
+	"github.com/kyndverse/permify-go/internal/policy"
 
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	authv3 "github.com/envoyproxy/go-control-plane/envoy/service/auth/v3"
@@ -183,11 +184,9 @@ func main() {
 		)
 	}
 
-	authService :=
-		authorization.NewService()
-
-	tokenVerifier :=
-		authentication.NewJWTVerifier(jwtSecret)
+	policyMatcher := policy.NewMatcher()
+	authService := authorization.NewService(policyMatcher)
+	tokenVerifier := authentication.NewJWTVerifier(jwtSecret)
 
 	grpcServer := grpc.NewServer()
 
@@ -200,7 +199,7 @@ func main() {
 	)
 
 	log.Println(
-		"GopherGuard ext_authz server running on :50051",
+		"Permify-go ext_authz server running on :50051",
 	)
 
 	if err := grpcServer.Serve(listener); err != nil {
