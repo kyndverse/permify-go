@@ -8,8 +8,8 @@ import (
 )
 
 const (
-	Issuer   = "gopher-guard-auth"
-	Audience = "gopher-guard"
+	Issuer   = "permify-auth"
+	Audience = "permify"
 )
 
 type Claims struct {
